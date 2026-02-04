@@ -9,6 +9,13 @@ from rich import print
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import DFlashDraftModel, sample, load_and_process_dataset, extract_context_feature
+from model.quantization import quantize_w4a16_inplace, audit_w4a16_replacement
+import os
+
+try:
+    from safetensors import safe_open
+except Exception:
+    safe_open = None
 import distributed as dist
 
 def cuda_time() -> float:
@@ -128,6 +135,7 @@ def dflash_generate(
     )
 
 
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
@@ -161,6 +169,37 @@ def main() -> None:
         attn_implementation="flash_attention_2",
         dtype=torch.bfloat16,
     ).to(device).eval()
+
+    quant_path = f"{args.draft_name_or_path.rstrip('/')}/model.safetensors"
+    did_quantize = False
+    try:
+        if safe_open is not None and os.path.isfile(quant_path):
+            with safe_open(quant_path, framework="pt", device="cpu") as f:
+                did_quantize = any(k.endswith(".weight_packed") for k in f.keys())
+    except Exception:
+        did_quantize = False
+
+    if did_quantize:
+        replaced = quantize_w4a16_inplace(
+            draft_model,
+            quant_path,
+            strict=True,
+        )
+        print(f"[draft quant] detected quant weights in {quant_path}")
+        print(f"[draft quant] replaced linear layers: {replaced}")
+        audit = audit_w4a16_replacement(draft_model, quant_path)
+        print(f"[draft quant] audit: {audit}")
+        if len(audit["missing_in_model"]) > 0:
+            raise RuntimeError(
+                f"Draft quant checkpoint contains prefixes not found in model. Example: {audit['missing_in_model'][:10]}"
+            )
+        if len(audit["not_replaced_but_quant_available"]) > 0:
+            raise RuntimeError(
+                f"Draft quantization incomplete: {len(audit['not_replaced_but_quant_available'])} prefixes still map to nn.Linear. "
+                f"Example: {audit['not_replaced_but_quant_available'][:10]}"
+            )
+    else:
+        print(f"[draft quant] no quant weights detected (skip): {quant_path}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     if tokenizer.mask_token_id is None:
