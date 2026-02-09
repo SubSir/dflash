@@ -24,7 +24,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     sin = sin.unsqueeze(unsqueeze_dim)
     q_len = q.size(-2)
     q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    k_len = k.size(-2)
+    if cos.size(-2) < k_len:
+        cos = torch.cat([cos[..., :1, :].expand(*cos.shape[:-2], k_len - cos.size(-2), cos.shape[-1]), cos], dim=-2)
+        sin = torch.cat([sin[..., :1, :].expand(*sin.shape[:-2], k_len - sin.size(-2), sin.shape[-1]), sin], dim=-2)
+    k_embed = (k * cos[..., -k_len:, :]) + (rotate_half(k) * sin[..., -k_len:, :])
     return q_embed, k_embed
 
 class Qwen3DFlashAttention(nn.Module):
@@ -66,6 +70,8 @@ class Qwen3DFlashAttention(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
+        if target_hidden is None:
+            target_hidden = hidden_states[:, :0, :]
         ctx_len = target_hidden.shape[1]
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
@@ -173,6 +179,20 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
+        if hidden_states is None:
+            if target_hidden is not None:
+                bsz = target_hidden.shape[0]
+                q_len = target_hidden.shape[1]
+                device = target_hidden.device
+                dtype = target_hidden.dtype
+            else:
+                bsz = 1
+                q_len = position_ids.shape[1] if position_ids is not None else 1
+                device = position_ids.device if position_ids is not None else None
+                dtype = torch.bfloat16
+            hidden_states = torch.zeros((bsz, q_len, self.config.hidden_size), device=device, dtype=dtype)
+        if target_hidden is None:
+            target_hidden = torch.zeros((hidden_states.shape[0], hidden_states.shape[1], len(self.target_layer_ids) * self.config.hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:

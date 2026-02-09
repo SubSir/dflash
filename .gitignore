@@ -7,3 +7,5 @@ data*/
 jobs/
 wandb/
 logs/
+
+quantized_model/
