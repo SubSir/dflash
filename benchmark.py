@@ -10,6 +10,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import DFlashDraftModel, sample, load_and_process_dataset, extract_context_feature
 from model.quantization import quantize_w4a16_inplace, audit_w4a16_replacement
+from model.pseudo import PseudoLinear
 import os
 
 try:
@@ -69,11 +70,15 @@ def dflash_generate(
     start = input_ids.shape[1]
     acceptance_lengths = []
     draft_prefill = True
+    total_target_time = 0.0
+    total_draft_time = 0.0
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
         block_position_ids = position_ids[:, start : start + block_size]
         if block_size > 1:
+            # Draft forward timing
+            draft_start = cuda_time()
             noise_embedding = target.model.embed_tokens(block_output_ids)
             draft_logits = target.lm_head(model(
                 target_hidden=target_hidden,
@@ -85,10 +90,14 @@ def dflash_generate(
             )[:, -block_size+1:, :])
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
+            draft_time = cuda_time() - draft_start
+            total_draft_time += draft_time
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
 
+        # Target forward timing
+        target_start = cuda_time()
         output = target(
             block_output_ids,
             position_ids=block_position_ids,
@@ -96,6 +105,8 @@ def dflash_generate(
             use_cache=True,
             output_hidden_states=True if block_size > 1 else False,
         )
+        target_time = cuda_time() - target_start
+        total_target_time += target_time
 
         posterior = sample(output.logits, temperature)
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
@@ -132,19 +143,33 @@ def dflash_generate(
         time_to_first_token=time_to_first_token,
         time_per_output_token=time_per_output_token,
         acceptance_lengths=acceptance_lengths,
+        total_target_time=total_target_time,
+        total_draft_time=total_draft_time,
     )
 
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name-or-path", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--draft-name-or-path", type=str, default="None")
-    parser.add_argument("--block-size", type=int, required=True)
-    parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=16384)
+    parser.add_argument("--model-name-or-path", type=str, default="Qwen/Qwen3-8B")
+    parser.add_argument("--draft-name-or-path", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--dataset", type=str, default="gsm8k")
+    parser.add_argument("--max-samples", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--target-model",
+        type=str,
+        default="hf",
+        choices=["hf", "pseudolinear"],
+    )
+    parser.add_argument(
+        "--pseudolinear-mode",
+        type=str,
+        default="nvfp4",
+        choices=["nvfp4", "fp8", "none"],
+    )
     args = parser.parse_args()
 
     random.seed(0)
@@ -160,13 +185,33 @@ def main() -> None:
 
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        attn_implementation="flash_attention_2",
         dtype=torch.bfloat16,
     ).to(device).eval()
 
+    if args.target_model == "pseudolinear":
+        replaced = 0
+        for name, module in list(target.named_modules()):
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            if name.endswith("lm_head"):
+                continue
+            parent = target
+            parts = name.split(".")
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            new_m = PseudoLinear(
+                in_features=int(module.in_features),
+                out_features=int(module.out_features),
+                bias=(module.bias is not None),
+                quant_mode=args.pseudolinear_mode,
+            ).to(device=device, dtype=module.weight.dtype)
+            new_m.from_linear(module)
+            setattr(parent, parts[-1], new_m)
+            replaced += 1
+        print(f"[target pseudolinear] replaced linear layers: {replaced}")
+
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_name_or_path,
-        attn_implementation="flash_attention_2",
         dtype=torch.bfloat16,
     ).to(device).eval()
 
@@ -255,6 +300,13 @@ def main() -> None:
     acceptance_lengths = list(chain(*[r[args.block_size].acceptance_lengths for r in responses]))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(args.block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+
+    # Per-model timing breakdown
+    total_target_time = np.mean([r[args.block_size].total_target_time for r in responses])
+    total_draft_time = np.mean([r[args.block_size].total_draft_time for r in responses])
+    print(f"Average target model time per sample: {total_target_time:.4f}s")
+    print(f"Average draft model time per sample: {total_draft_time:.4f}s")
+    print(f"Draft/Target time ratio: {total_draft_time / total_target_time:.3f}")
 
 if __name__ == "__main__":
     main()

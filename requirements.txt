@@ -8,3 +8,4 @@ packaging
 ninja
 rich
 tqdm
+zstandard

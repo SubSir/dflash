@@ -9,3 +9,6 @@ wandb/
 logs/
 
 quantized_model/
+*.pt
+*.png
+llm-awq/
