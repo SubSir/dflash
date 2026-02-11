@@ -193,7 +193,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             hidden_states = torch.zeros((bsz, q_len, self.config.hidden_size), device=device, dtype=dtype)
         if target_hidden is None:
             target_hidden = torch.zeros((hidden_states.shape[0], hidden_states.shape[1], len(self.target_layer_ids) * self.config.hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
+        target_hidden = self.hidden_norm(self.fc(target_hidden, is_hidden_states=False))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(

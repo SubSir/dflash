@@ -245,7 +245,7 @@ def quant_to_nvfp4(weight: torch.Tensor) -> torch.Tensor:
     org_shape = weight.shape
     org_dtype = weight.dtype
     weight = weight.reshape(-1, 16)
-    global_scale = weight.float().abs().amax() / 448.0 / 6.0
+    global_scale = weight.float().abs().amax().clamp(min=1e-4) / 448.0 / 6.0
     scale = (weight / global_scale / 6.0).abs().max(dim=-1, keepdim=True).values.clamp(min=1e-4).to(torch.float8_e4m3fn).to(org_dtype)
     weight = (weight / scale / global_scale).to(org_dtype)
     weight = simple_fp4_pseudo_quantize(weight)
@@ -278,18 +278,18 @@ def delta_quantize_dequantize_x(x: torch.Tensor, n: int) -> torch.Tensor:
     Note: We quantize both base and delta with `quant_to_nvfp4`.
     """
     if x.dim() != 3:
-        return x
+        raise ValueError(f"x.dim() needs to be 3, but got {x.dim()}")
 
     bs, seq_len, dim = x.shape
     if seq_len <= 1:
-        return x
+        raise ValueError(f"seq_len {seq_len} needs to be > 1")
 
     if n == 1:
         return quant_to_nvfp4(x)
 
     # If not divisible, fallback to original x quant (keeps behavior safe for unexpected shapes)
     if seq_len % n != 0:
-        return quant_to_nvfp4(x)
+        raise ValueError(f"seq_len {seq_len} is not divisible by n {n}")
 
     g = seq_len // n
 
@@ -306,7 +306,7 @@ def delta_quantize_dequantize_x(x: torch.Tensor, n: int) -> torch.Tensor:
         x_recon[:, 1, :] = base0_hat.squeeze(1)
         if n > 2:
             others0 = xg[:, 0, 2:, :]  # tokens [2..n-1]
-            delta0 = others0 - base0
+            delta0 = others0 - base0_hat
             delta0_hat = quant_to_nvfp4(delta0)
             recon0 = base0_hat + delta0_hat
             x_recon[:, 2:n, :] = recon0
@@ -323,7 +323,7 @@ def delta_quantize_dequantize_x(x: torch.Tensor, n: int) -> torch.Tensor:
 
         if n > 1:
             others = xg[:, 1:, 1:, :]  # (bs, g-1, n-1, dim)
-            delta = others - base
+            delta = others - base_hat
             delta_hat = quant_to_nvfp4(delta)
             recon = base_hat + delta_hat  # (bs, g-1, n-1, dim)
 
@@ -374,6 +374,8 @@ class PseudoLinear(nn.Module):
                 x = delta_quantize_dequantize_x(x, self.fixed_n)
             elif not is_hidden_states:
                 x = quant_to_nvfp4(x)
+            else:
+                raise ValueError(f"x.dim() needs to be 3, but got {x.dim()}")
         elif self.quant_mode == "nvfp4":
             x = quant_to_nvfp4(x)
         elif self.quant_mode == "fp8":
@@ -430,7 +432,7 @@ def load_fixed_n_config(path: str) -> dict:
 
 def report_delta_stats():
     print("\n" + "="*80)
-    print(f"{'Layer Name':<50} | Best n (Count) | Selected n")
+    print(f"{'Layer Name':<50} | Best n (Count) | Total MSE (per n) | Selected n")
     print("-" * 80)
     final_n_config = {}
     for name, stats in sorted(PSEUDO_LINEAR_STATS.items()):
@@ -438,13 +440,16 @@ def report_delta_stats():
         best_n = 1
         max_count = -1
         counts_str = []
+        mse_str = []
         for n in [1, 2, 4, 8, 16]:
             count = stats[n]["best_count"]
+            total_mse = stats[n]["total_mse"]
             counts_str.append(f"{n}:{count}")
+            mse_str.append(f"{n}:{total_mse:.6g}")
             if count > max_count:
                 max_count = count
                 best_n = n
-        
+
         # Alternatively, find n with minimum total_mse
         # min_mse_n = 1
         # min_mse = float('inf')
@@ -452,9 +457,8 @@ def report_delta_stats():
         #     if stats[n]["total_mse"] < min_mse:
         #         min_mse = stats[n]["total_mse"]
         #         min_mse_n = n
-        
+
         final_n_config[name] = best_n
-        print(f"{name[:50]:<50} | {', '.join(counts_str)} | {best_n}")
+        print(f"{name[:50]:<50} | {', '.join(counts_str)} | {', '.join(mse_str)} | {best_n}")
     print("="*80 + "\n")
     return final_n_config
-
