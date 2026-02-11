@@ -10,7 +10,6 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import DFlashDraftModel, sample, load_and_process_dataset, extract_context_feature
 from model.quantization import quantize_w4a16_inplace, audit_w4a16_replacement
-from model.pseudo import PseudoLinear
 import os
 
 try:
@@ -158,18 +157,9 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument(
-        "--target-model",
-        type=str,
-        default="hf",
-        choices=["hf", "pseudolinear"],
-    )
-    parser.add_argument(
-        "--pseudolinear-mode",
-        type=str,
-        default="nvfp4",
-        choices=["nvfp4", "fp8", "none"],
-    )
+    parser.add_argument("--delta-n-mode", type=str, default="learn", choices=["learn", "infer"], help="learn: collect stats and save per-layer n; infer: load per-layer n and apply")
+    parser.add_argument("--delta-n-config", type=str, default=None, help="Path to save/load per-layer n config (json)")
+    parser.add_argument("--delta-n-select", type=str, default="best_count", choices=["best_count", "total_mse"], help="How to select fixed n from stats when saving")
     args = parser.parse_args()
 
     random.seed(0)
@@ -188,32 +178,51 @@ def main() -> None:
         dtype=torch.bfloat16,
     ).to(device).eval()
 
-    if args.target_model == "pseudolinear":
-        replaced = 0
-        for name, module in list(target.named_modules()):
-            if not isinstance(module, torch.nn.Linear):
-                continue
-            if name.endswith("lm_head"):
-                continue
-            parent = target
-            parts = name.split(".")
-            for p in parts[:-1]:
-                parent = getattr(parent, p)
-            new_m = PseudoLinear(
-                in_features=int(module.in_features),
-                out_features=int(module.out_features),
-                bias=(module.bias is not None),
-                quant_mode=args.pseudolinear_mode,
-            ).to(device=device, dtype=module.weight.dtype)
-            new_m.from_linear(module)
-            setattr(parent, parts[-1], new_m)
-            replaced += 1
-        print(f"[target pseudolinear] replaced linear layers: {replaced}")
-
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_name_or_path,
         dtype=torch.bfloat16,
     ).to(device).eval()
+
+    # Replace draft model linears with PseudoLinear for delta-n learn/infer
+    from model.pseudo import PseudoLinear, report_delta_stats, load_fixed_n_config, save_fixed_n_config
+    replaced_draft = 0
+    for name, module in list(draft_model.named_modules()):
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if name.endswith("lm_head"):
+            continue
+        # We want to learn for all linear layers in the draft model
+        parent = draft_model
+        parts = name.split(".")
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        
+        quant_mode = "delta_learn" if args.delta_n_mode == "learn" else "delta_inference"
+        new_m = PseudoLinear(
+            in_features=int(module.in_features),
+            out_features=int(module.out_features),
+            bias=(module.bias is not None),
+            quant_mode=quant_mode,
+            layer_name=name,
+        ).to(device=device, dtype=module.weight.dtype)
+        new_m.from_linear(module)
+        setattr(parent, parts[-1], new_m)
+        replaced_draft += 1
+    if args.delta_n_mode == "infer":
+        if args.delta_n_config is None:
+            raise ValueError("--delta-n-config is required when --delta-n-mode=infer")
+        fixed_n_cfg = load_fixed_n_config(args.delta_n_config)
+        missing = 0
+        for name, m in draft_model.named_modules():
+            if isinstance(m, PseudoLinear) and m.quant_mode == "delta_inference":
+                if name in fixed_n_cfg:
+                    m.fixed_n = int(fixed_n_cfg[name])
+                else:
+                    missing += 1
+        if missing > 0 and dist.is_main():
+            print(f"[delta-n][infer] warning: {missing} PseudoLinear layers missing fixed_n config (default=1)")
+
+    print(f"[draft pseudolinear] replaced linear layers: {replaced_draft} mode={args.delta_n_mode}")
 
     quant_path = f"{args.draft_name_or_path.rstrip('/')}/model.safetensors"
     did_quantize = False
@@ -307,6 +316,12 @@ def main() -> None:
     print(f"Average target model time per sample: {total_target_time:.4f}s")
     print(f"Average draft model time per sample: {total_draft_time:.4f}s")
     print(f"Draft/Target time ratio: {total_draft_time / total_target_time:.3f}")
+
+    if dist.is_main():
+        report_delta_stats()
+        if args.delta_n_mode == "learn" and args.delta_n_config is not None:
+            save_fixed_n_config(args.delta_n_config, selection=args.delta_n_select)
+            print(f"[delta-n][learn] saved fixed_n config to: {args.delta_n_config}")
 
 if __name__ == "__main__":
     main()

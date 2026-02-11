@@ -253,28 +253,132 @@ def quant_to_nvfp4(weight: torch.Tensor) -> torch.Tensor:
     weight = weight.reshape(org_shape).to(org_dtype)
     return weight
 
+import json
+from collections import defaultdict
+
+import torch.nn.functional as F
+
+# Global registry to store stats for all layers
+PSEUDO_LINEAR_STATS = defaultdict(lambda: {n: {"best_count": 0, "total_mse": 0.0} for n in [1, 2, 4, 8, 16]})
+
+def delta_quantize_dequantize_x(x: torch.Tensor, n: int) -> torch.Tensor:
+    """Delta quantize-dequantize x along token dimension (dim=1), fully vectorized.
+
+    Assumptions for fast path (as you stated for hidden_states):
+      - x is (bs, seq_len, dim)
+      - seq_len == block_size
+      - block_size % n == 0
+
+    Grouping rule (within the block):
+      - groups: [0..n-1], [n..2n-1], ...
+      - token 0 is kept as-is (no quant, no delta)
+      - for group0: base is token1, apply delta to tokens [2..n-1]
+      - for other groups: base is first token of group (k*n), apply delta to rest
+
+    Note: We quantize both base and delta with `quant_to_nvfp4`.
+    """
+    if x.dim() != 3:
+        return x
+
+    bs, seq_len, dim = x.shape
+    if seq_len <= 1:
+        return x
+
+    if n == 1:
+        return quant_to_nvfp4(x)
+
+    # If not divisible, fallback to original x quant (keeps behavior safe for unexpected shapes)
+    if seq_len % n != 0:
+        return quant_to_nvfp4(x)
+
+    g = seq_len // n
+
+    x_recon = x.clone()
+
+    # reshape into groups
+    xg = x.view(bs, g, n, dim)
+
+    # ---- group 0 ----
+    # token 0 unchanged
+    if n > 1:
+        base0 = xg[:, 0, 1:2, :]  # token1
+        base0_hat = quant_to_nvfp4(base0)
+        x_recon[:, 1, :] = base0_hat.squeeze(1)
+        if n > 2:
+            others0 = xg[:, 0, 2:, :]  # tokens [2..n-1]
+            delta0 = others0 - base0
+            delta0_hat = quant_to_nvfp4(delta0)
+            recon0 = base0_hat + delta0_hat
+            x_recon[:, 2:n, :] = recon0
+
+    # ---- groups 1..g-1 ----
+    if g > 1:
+        base = xg[:, 1:, 0:1, :]  # (bs, g-1, 1, dim)
+        base_hat = quant_to_nvfp4(base)
+
+        # place base tokens
+        base_flat = base_hat.squeeze(2)  # (bs, g-1, dim)
+        base_pos = (torch.arange(1, g, device=x.device) * n).view(1, g - 1, 1).expand(bs, g - 1, 1)
+        x_recon.scatter_(1, base_pos.expand(bs, g - 1, dim), base_flat)
+
+        if n > 1:
+            others = xg[:, 1:, 1:, :]  # (bs, g-1, n-1, dim)
+            delta = others - base
+            delta_hat = quant_to_nvfp4(delta)
+            recon = base_hat + delta_hat  # (bs, g-1, n-1, dim)
+
+            # scatter recon tokens to positions base_pos + [1..n-1]
+            offsets = torch.arange(1, n, device=x.device).view(1, 1, n - 1, 1)
+            pos = (torch.arange(1, g, device=x.device).view(1, g - 1, 1, 1) * n) + offsets
+            pos = pos.expand(bs, g - 1, n - 1, 1)
+            x_recon.scatter_(1, pos.expand(bs, g - 1, n - 1, dim).reshape(bs, -1, dim), recon.reshape(bs, -1, dim))
+
+    return x_recon
+
 class PseudoLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, quant_mode: str = "nvfp4"):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, quant_mode: str = "nvfp4", layer_name: str = "unknown"):
         """
         Args:
-            quant_mode: "nvfp4", "fp8", or "none" (no quantization)
+            quant_mode: "nvfp4", "fp8", "delta_learn", "delta_inference", or "none"
         """
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.quant_mode = quant_mode
+        self.layer_name = layer_name
+        self.fixed_n = 1
         self.weight = nn.Parameter(torch.randn(out_features, in_features))
         if bias:
             self.bias = nn.Parameter(torch.randn(out_features))
         else:
             self.register_parameter('bias', None)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, is_hidden_states: bool = True) -> torch.Tensor:
         w = self.weight
-        if self.quant_mode == "nvfp4":
+
+        if self.quant_mode == "delta_learn":
+            if is_hidden_states and x.dim() == 3:
+                best_n = 1
+                min_mse = float("inf")
+                for n in [1, 2, 4, 8, 16]:
+                    x_hat = delta_quantize_dequantize_x(x, n)
+                    mse = F.mse_loss(x, x_hat).item()
+                    PSEUDO_LINEAR_STATS[self.layer_name][n]["total_mse"] += mse
+                    if mse < min_mse:
+                        min_mse = mse
+                        best_n = n
+                PSEUDO_LINEAR_STATS[self.layer_name][best_n]["best_count"] += 1
+            # learning阶段不改变真实前向输入
+        elif self.quant_mode == "delta_inference":
+            if is_hidden_states and x.dim() == 3:
+                x = delta_quantize_dequantize_x(x, self.fixed_n)
+            elif not is_hidden_states:
+                x = quant_to_nvfp4(x)
+        elif self.quant_mode == "nvfp4":
             x = quant_to_nvfp4(x)
         elif self.quant_mode == "fp8":
             x = quant_to_fp8(x)
+
         if self.bias is not None:
             return x @ w.t() + self.bias
         return x @ w.t()
@@ -287,7 +391,70 @@ class PseudoLinear(nn.Module):
             self.weight.data = quant_to_fp8(self.weight.data)
         if linear.bias is not None:
             self.bias.data = linear.bias.data
-            del linear.bias
-        del linear.weight
-        torch.cuda.empty_cache()
+            # Do not delete bias from original linear here if we are just replacing
+        # Optimization: cast to original dtype if needed
+        self.weight.data = self.weight.data.to(linear.weight.dtype)
+        if self.bias is not None:
+            self.bias.data = self.bias.data.to(linear.weight.dtype)
+
+def select_fixed_n_config(selection: str = "best_count"):
+    """Return dict[layer_name] = fixed_n.
+
+    selection:
+      - "best_count": choose n with max best_count
+      - "total_mse": choose n with min total_mse
+    """
+    final_n_config = {}
+    for name, stats in PSEUDO_LINEAR_STATS.items():
+        if selection == "total_mse":
+            best_n = min([1, 2, 4, 8, 16], key=lambda n: stats[n]["total_mse"])
+        else:
+            best_n = max([1, 2, 4, 8, 16], key=lambda n: stats[n]["best_count"])
+        final_n_config[name] = int(best_n)
+    return dict(sorted(final_n_config.items()))
+
+
+def save_fixed_n_config(path: str, selection: str = "best_count") -> dict:
+    cfg = select_fixed_n_config(selection=selection)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2, sort_keys=True)
+    return cfg
+
+
+def load_fixed_n_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    # normalize
+    return {str(k): int(v) for k, v in cfg.items()}
+
+
+def report_delta_stats():
+    print("\n" + "="*80)
+    print(f"{'Layer Name':<50} | Best n (Count) | Selected n")
+    print("-" * 80)
+    final_n_config = {}
+    for name, stats in sorted(PSEUDO_LINEAR_STATS.items()):
+        # Find n with most best_counts
+        best_n = 1
+        max_count = -1
+        counts_str = []
+        for n in [1, 2, 4, 8, 16]:
+            count = stats[n]["best_count"]
+            counts_str.append(f"{n}:{count}")
+            if count > max_count:
+                max_count = count
+                best_n = n
+        
+        # Alternatively, find n with minimum total_mse
+        # min_mse_n = 1
+        # min_mse = float('inf')
+        # for n in [1, 2, 4, 8, 16]:
+        #     if stats[n]["total_mse"] < min_mse:
+        #         min_mse = stats[n]["total_mse"]
+        #         min_mse_n = n
+        
+        final_n_config[name] = best_n
+        print(f"{name[:50]:<50} | {', '.join(counts_str)} | {best_n}")
+    print("="*80 + "\n")
+    return final_n_config
 
