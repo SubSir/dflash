@@ -74,12 +74,7 @@ def quantize_w4a16_inplace(
     strict: bool = True,
     verbose: bool = True,
 ) -> int:
-    """Replace nn.Linear modules with QuantLinearW4A16 wherever quant keys exist.
-
-    Rule: if quant checkpoint has keys for a module name prefix, the model must contain
-    that module and it will be replaced. If any quant prefix cannot be mapped to a module,
-    raise (strict behavior).
-    """
+    """Replace nn.Linear modules with QuantLinearW4A16 wherever quant keys exist."""
 
     if safetensors_load_file is None:
         raise ImportError(
@@ -150,9 +145,7 @@ def quantize_w4a16_inplace(
                 f"packed={tuple(wpk.shape)} scale={tuple(wsc.shape)} wsh={wsh.tolist()}"
             )
 
-    # Final strict check: no quant prefix should remain un-replaced.
     if strict:
-        # Rebuild name_to_module after replacement.
         name_to_module2: dict[str, nn.Module] = {name: m for name, m in model.named_modules() if name}
         not_replaced = [p for p in quant_prefixes if isinstance(name_to_module2.get(p), nn.Linear)]
         if not_replaced:

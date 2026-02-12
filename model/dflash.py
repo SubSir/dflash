@@ -76,9 +76,14 @@ class Qwen3DFlashAttention(nn.Module):
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden, is_hidden_states=False)
+        if hasattr(self.k_proj, "quant_mode"):
+            k_ctx = self.k_proj(target_hidden, is_hidden_states=False)
+            v_ctx = self.v_proj(target_hidden, is_hidden_states=False)
+        else:
+            k_ctx = self.k_proj(target_hidden)
+            v_ctx = self.v_proj(target_hidden)
         k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden, is_hidden_states=False)
+        v_noise = self.v_proj(hidden_states)
         v_noise = self.v_proj(hidden_states)
         k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
         v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
@@ -193,7 +198,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             hidden_states = torch.zeros((bsz, q_len, self.config.hidden_size), device=device, dtype=dtype)
         if target_hidden is None:
             target_hidden = torch.zeros((hidden_states.shape[0], hidden_states.shape[1], len(self.target_layer_ids) * self.config.hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
-        target_hidden = self.hidden_norm(self.fc(target_hidden, is_hidden_states=False))
+        if hasattr(self.fc, "quant_mode"):
+            target_hidden = self.hidden_norm(self.fc(target_hidden, is_hidden_states=False))
+        else:
+            target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(
