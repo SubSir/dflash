@@ -245,8 +245,6 @@ def generate_verify_pred_k_online(
         online_state["count_by_acc"] = count_by_acc
     global_step = int(online_state.get("global_step", 0))
     step_traces = online_state.setdefault("step_traces", [])
-    print(global_step, flush=True)
-
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -399,7 +397,13 @@ def main() -> None:
     parser.add_argument("--model-name-or-path", type=str, default="Qwen/Qwen3-8B")
     parser.add_argument("--draft-name-or-path", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
     parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--dataset", type=str, default="swe-bench")
+    parser.add_argument("--dataset", type=str, default="swe-bench", help="Single dataset name. Deprecated: prefer --datasets.")
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        default=None,
+        help="Comma-separated datasets to run sequentially, e.g. 'gsm8k,math500,humaneval,mt-bench'. If set, overrides --dataset.",
+    )
     parser.add_argument("--max-samples", type=int, default=12)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -433,109 +437,125 @@ def main() -> None:
     if tokenizer.mask_token_id is None:
         tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
 
-    dataset = load_and_process_dataset(args.dataset)
-    if args.max_samples is not None and len(dataset) > args.max_samples:
-        dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
+    # 支持一次顺序跑多个数据集：--datasets=...（优先）否则回退到 --dataset
+    if args.datasets is not None and str(args.datasets).strip():
+        dataset_names = [x.strip() for x in str(args.datasets).split(",") if x.strip()]
+    else:
+        dataset_names = [str(args.dataset).strip()]
 
-    responses = []
-    online_state = {
-        "sum_by_acc": None,
-        "count_by_acc": None,
-        "global_step": 0,
-        "step_traces": [],
-    }
+    # 总输出：按 dataset 分开聚合，避免不同数据集混在一起
+    out = {"args": vars(args), "by_dataset": {}}
 
-    indices = range(dist.rank(), len(dataset), dist.size())
-    for idx in tqdm(indices, disable=not dist.is_main()):
-        instance = dataset[idx]
-        messages = []
-        for user_content in instance["turns"]:
-            messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
+    for data_name in dataset_names:
+        dataset = load_and_process_dataset(data_name)
+        if args.max_samples is not None and len(dataset) > args.max_samples:
+            dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
 
-            if args.mode in ["both", "baseline"]:
-                r_all = generate_verify_all(
-                    model=draft_model,
-                    target=target,
-                    input_ids=input_ids,
-                    mask_token_id=tokenizer.mask_token_id,
-                    max_new_tokens=args.max_new_tokens,
-                    block_size=args.block_size,
-                    stop_token_ids=[tokenizer.eos_token_id],
-                    temperature=args.temperature,
+        responses = []
+        online_state = {
+            "sum_by_acc": None,
+            "count_by_acc": None,
+            "global_step": 0,
+            "step_traces": [],
+        }
+
+        indices = range(dist.rank(), len(dataset), dist.size())
+        for idx in tqdm(indices, disable=not dist.is_main()):
+            instance = dataset[idx]
+            messages = []
+            for user_content in instance["turns"]:
+                messages.append({"role": "user", "content": user_content})
+                input_text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
                 )
-                responses.append(("baseline", r_all))
+                input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
-            if args.mode in ["both", "pred"]:
-                r_pred = generate_verify_pred_k_online(
-                    model=draft_model,
-                    target=target,
-                    input_ids=input_ids,
-                    mask_token_id=tokenizer.mask_token_id,
-                    max_new_tokens=args.max_new_tokens,
-                    block_size=args.block_size,
-                    stop_token_ids=[tokenizer.eos_token_id],
-                    offset=args.offset,
-                    warmup_steps=args.warmup_steps,
-                    temperature=args.temperature,
-                    online_state=online_state,
-                )
-                responses.append(("pred", r_pred))
+                if args.mode in ["both", "baseline"]:
+                    r_all = generate_verify_all(
+                        model=draft_model,
+                        target=target,
+                        input_ids=input_ids,
+                        mask_token_id=tokenizer.mask_token_id,
+                        max_new_tokens=args.max_new_tokens,
+                        block_size=args.block_size,
+                        stop_token_ids=[tokenizer.eos_token_id],
+                        temperature=args.temperature,
+                    )
+                    responses.append(("baseline", r_all))
 
-            messages.append({"role": "assistant", "content": ""})
+                if args.mode in ["both", "pred"]:
+                    r_pred = generate_verify_pred_k_online(
+                        model=draft_model,
+                        target=target,
+                        input_ids=input_ids,
+                        mask_token_id=tokenizer.mask_token_id,
+                        max_new_tokens=args.max_new_tokens,
+                        block_size=args.block_size,
+                        stop_token_ids=[tokenizer.eos_token_id],
+                        offset=args.offset,
+                        warmup_steps=args.warmup_steps,
+                        temperature=args.temperature,
+                        online_state=online_state,
+                    )
+                    responses.append(("pred", r_pred))
 
-    if dist.size() > 1:
-        responses = dist.gather(responses, dst=0)
+                messages.append({"role": "assistant", "content": ""})
+
+        if dist.size() > 1:
+            responses = dist.gather(responses, dst=0)
+            if not dist.is_main():
+                # 非主进程只负责计算，不落盘
+                continue
+            responses = list(chain(*responses))
+
         if not dist.is_main():
-            print(f"[speed] non-main rank={dist.rank()} size={dist.size()} gathered; exiting without writing json")
-            return
-        responses = list(chain(*responses))
+            continue
 
-    if not dist.is_main():
-        print(f"[speed] non-main rank={dist.rank()} size={dist.size()} exiting without writing json")
-        return
+        by_mode = {"baseline": [], "pred": []}
+        for mode, r in responses:
+            by_mode[mode].append(r)
 
-    by_mode = {"baseline": [], "pred": []}
-    for mode, r in responses:
-        by_mode[mode].append(r)
+        def _agg(rs):
+            return {
+                "time_to_first_token": float(sum(x.time_to_first_token for x in rs) / max(1, len(rs))),
+                "time_per_output_token": float(sum(x.time_per_output_token for x in rs) / max(1, len(rs))),
+                "total_target_time": float(sum(x.total_target_time for x in rs) / max(1, len(rs))),
+                "total_draft_time": float(sum(x.total_draft_time for x in rs) / max(1, len(rs))),
+                # verify 调用次数/verify token 总量是“总量指标”，这里不取均值而是求和更直观
+                "total_target_verify_calls": int(sum(getattr(x, "total_target_verify_calls", 0) for x in rs)),
+                "total_target_verify_tokens": int(sum(getattr(x, "total_target_verify_tokens", 0) for x in rs)),
+                "num_output_tokens": float(sum(x.num_output_tokens for x in rs) / max(1, len(rs))),
+            }
 
-    def _agg(rs):
-        return {
-            "time_to_first_token": float(sum(x.time_to_first_token for x in rs) / max(1, len(rs))),
-            "time_per_output_token": float(sum(x.time_per_output_token for x in rs) / max(1, len(rs))),
-            "total_target_time": float(sum(x.total_target_time for x in rs) / max(1, len(rs))),
-            "total_draft_time": float(sum(x.total_draft_time for x in rs) / max(1, len(rs))),
-            # verify 调用次数/verify token 总量是“总量指标”，这里不取均值而是求和更直观
-            "total_target_verify_calls": int(sum(getattr(x, "total_target_verify_calls", 0) for x in rs)),
-            "total_target_verify_tokens": int(sum(getattr(x, "total_target_verify_tokens", 0) for x in rs)),
-            "num_output_tokens": float(sum(x.num_output_tokens for x in rs) / max(1, len(rs))),
-        }
+        data_out = {"dataset": data_name, "n_samples": int(len(dataset))}
+        if by_mode["baseline"]:
+            data_out["baseline_verify_all"] = _agg(by_mode["baseline"])
+        if by_mode["pred"]:
+            data_out["pred_verify_k_online"] = _agg(by_mode["pred"])
+            data_out["pred_stats"] = {
+                **by_mode["pred"][0].pred_stats,
+                "global_step_final": int(online_state.get("global_step", 0)),
+            }
 
-    out = {"args": vars(args)}
-    if by_mode["baseline"]:
-        out["baseline_verify_all"] = _agg(by_mode["baseline"])
+        if "baseline_verify_all" in data_out and "pred_verify_k_online" in data_out:
+            data_out["speedup_time_per_token"] = float(
+                data_out["baseline_verify_all"]["time_per_output_token"]
+                / max(1e-9, data_out["pred_verify_k_online"]["time_per_output_token"])
+            )
+            data_out["target_verify_token_ratio"] = float(
+                data_out["pred_verify_k_online"]["total_target_verify_tokens"]
+                / max(1e-9, data_out["baseline_verify_all"]["total_target_verify_tokens"])
+            )
 
-    if by_mode["pred"]:
-        out["pred_verify_k_online"] = _agg(by_mode["pred"])
-        # merge pred_stats by just taking the first (they should be similar across samples; this is a coarse summary)
-        out["pred_stats"] = {
-            **by_mode["pred"][0].pred_stats,
-            "global_step_final": int(online_state.get("global_step", 0)),
-        }
+        out["by_dataset"][data_name] = data_out
 
-    # optional combined speedup (only valid if both ran in same process)
-    if "baseline_verify_all" in out and "pred_verify_k_online" in out:
-        out["speedup_time_per_token"] = float(out["baseline_verify_all"]["time_per_output_token"] / max(1e-9, out["pred_verify_k_online"]["time_per_output_token"]))
-        out["target_verify_token_ratio"] = float(out["pred_verify_k_online"]["total_target_verify_tokens"] / max(1e-9, out["baseline_verify_all"]["total_target_verify_tokens"]))
-
-    os.makedirs(os.path.dirname(args.out_json) or ".", exist_ok=True)
-    with open(args.out_json, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-
-    print("\n[speed] results saved to:", args.out_json)
+    # 旧的单数据集聚合/写盘逻辑已被上面的多数据集循环替代
+    # 这里统一在主进程写一次包含所有数据集的总 json
+    if dist.is_main():
+        os.makedirs(os.path.dirname(args.out_json) or ".", exist_ok=True)
+        with open(args.out_json, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        print("\n[speed] results saved to:", args.out_json)
