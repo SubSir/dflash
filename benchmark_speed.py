@@ -22,7 +22,6 @@ def cuda_time() -> float:
 
 def _predict_acc_len_from_nll(token_nll: torch.Tensor, thresholds: torch.Tensor) -> int:
     # token_nll: (num_pos,), thresholds: (num_pos,)
-    # 返回第一个 token_nll > thresholds 的位置索引；如果都不超过则返回 num_pos
     gt = token_nll > thresholds
     if bool(gt.any().item()):
         return int(gt.float().argmax().item())
@@ -92,7 +91,6 @@ def generate_verify_all(
     draft_prefill = True
     total_target_time = 0.0
     total_draft_time = 0.0
-    # target 的 forward(用于 verify) 被调用的次数，以及累计 verify 的 token 数
     total_target_verify_calls = 0
     total_target_verify_tokens = 0
 
@@ -227,7 +225,6 @@ def generate_verify_pred_k_online(
     draft_prefill = True
     total_target_time = 0.0
     total_draft_time = 0.0
-    # target 的 forward(用于 verify) 被调用的次数，以及累计 verify 的 token 数
     total_target_verify_calls = 0
     total_target_verify_tokens = 0
 
@@ -279,21 +276,27 @@ def generate_verify_pred_k_online(
         else:
             token_nll = None
 
-        thresholds = _build_thresholds_from_running(num_pos=num_pos, sum_by_acc=sum_by_acc, count_by_acc=count_by_acc, device=model.device)
+        draft_pred_start = cuda_time()
 
-        # 核心策略逻辑
+        thresholds = _build_thresholds_from_running(
+            num_pos=num_pos,
+            sum_by_acc=sum_by_acc,
+            count_by_acc=count_by_acc,
+            device=model.device,
+        )
+
         if global_step < warmup_steps or token_nll is None:
-            # Warmup 阶段：全量验证，不预测
             verify_len = block_size
             acc_pred = num_pos
             k = num_pos
         else:
-            # 预测阶段：根据 NLL 和 阈值 预测验证数量
             acc_pred = _predict_acc_len_from_nll(token_nll, thresholds)
             k = min(int(acc_pred) + int(offset), num_pos)
             verify_len = int(k) + 1
 
-        # 执行验证
+        draft_pred_time = cuda_time() - draft_pred_start
+        total_draft_time += draft_pred_time
+
         block_output_ids_k = block_output_ids[:, :verify_len]
         block_position_ids_k = block_position_ids[:, :verify_len]
 
@@ -319,7 +322,6 @@ def generate_verify_pred_k_online(
         else:
             acceptance_length = 0
 
-        # 如果是预测模式，实际长度受限于预测的验证长度 k
         if global_step >= warmup_steps:
             acceptance_length = int(min(int(acceptance_length), int(k)))
 
@@ -329,20 +331,21 @@ def generate_verify_pred_k_online(
         acc_true = int(acceptance_length) + 1
         acc_true_idx = int(min(int(acc_true), int(num_pos)))
 
-        # 记录数据：只记录要求的四项
         trace = {
-            "token_nll": [float(x) for x in token_nll.detach().float().to("cpu").tolist()] if token_nll is not None else None,
-            "thresholds": [float(x) for x in thresholds],
+            "token_nll": token_nll.detach() if token_nll is not None else None,
+            "thresholds": thresholds.detach(),
             "verify_len": int(verify_len),
             "acc_true": int(acc_true),
         }
         step_traces.append(trace)
 
 
-        # 更新运行统计数据用于计算阈值
+        draft_update_start = cuda_time()
         if token_nll is not None:
             sum_by_acc[acc_true_idx, :] += token_nll.to(torch.float32)
             count_by_acc[acc_true_idx] += 1
+        draft_update_time = cuda_time() - draft_update_start
+        total_draft_time += draft_update_time
 
         start += acceptance_length + 1
         past_key_values_target.crop(start)
@@ -404,7 +407,7 @@ def main() -> None:
         default=None,
         help="Comma-separated datasets to run sequentially, e.g. 'gsm8k,math500,humaneval,mt-bench'. If set, overrides --dataset.",
     )
-    parser.add_argument("--max-samples", type=int, default=12)
+    parser.add_argument("--max-samples", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--mode", type=str, default="both", choices=["both", "baseline", "pred"], help="Run baseline verify-all, pred verify-k (online), or both")
@@ -437,13 +440,11 @@ def main() -> None:
     if tokenizer.mask_token_id is None:
         tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
 
-    # 支持一次顺序跑多个数据集：--datasets=...（优先）否则回退到 --dataset
     if args.datasets is not None and str(args.datasets).strip():
         dataset_names = [x.strip() for x in str(args.datasets).split(",") if x.strip()]
     else:
         dataset_names = [str(args.dataset).strip()]
 
-    # 总输出：按 dataset 分开聚合，避免不同数据集混在一起
     out = {"args": vars(args), "by_dataset": {}}
 
     for data_name in dataset_names:
@@ -507,7 +508,6 @@ def main() -> None:
         if dist.size() > 1:
             responses = dist.gather(responses, dst=0)
             if not dist.is_main():
-                # 非主进程只负责计算，不落盘
                 continue
             responses = list(chain(*responses))
 
@@ -524,7 +524,6 @@ def main() -> None:
                 "time_per_output_token": float(sum(x.time_per_output_token for x in rs) / max(1, len(rs))),
                 "total_target_time": float(sum(x.total_target_time for x in rs) / max(1, len(rs))),
                 "total_draft_time": float(sum(x.total_draft_time for x in rs) / max(1, len(rs))),
-                # verify 调用次数/verify token 总量是“总量指标”，这里不取均值而是求和更直观
                 "total_target_verify_calls": int(sum(getattr(x, "total_target_verify_calls", 0) for x in rs)),
                 "total_target_verify_tokens": int(sum(getattr(x, "total_target_verify_tokens", 0) for x in rs)),
                 "num_output_tokens": float(sum(x.num_output_tokens for x in rs) / max(1, len(rs))),
@@ -535,8 +534,26 @@ def main() -> None:
             data_out["baseline_verify_all"] = _agg(by_mode["baseline"])
         if by_mode["pred"]:
             data_out["pred_verify_k_online"] = _agg(by_mode["pred"])
+
+            # pred_stats 里包含 step_traces。我们在 decode 过程中为了避免频繁 GPU->CPU 拷贝，
+            # 可能会把 token_nll/thresholds 以 Tensor 的形式暂存在 trace 里。
+            # 写 JSON 前在 rank0 做一次轻量的可序列化转换。
+            pred_stats = dict(by_mode["pred"][0].pred_stats)
+            step_traces_ser = []
+            for tr in pred_stats.get("step_traces", []) or []:
+                if not isinstance(tr, dict):
+                    step_traces_ser.append(tr)
+                    continue
+                tr2 = dict(tr)
+                for k_ in ["token_nll", "thresholds"]:
+                    v = tr2.get(k_)
+                    if isinstance(v, torch.Tensor):
+                        tr2[k_] = [float(x) for x in v.detach().to("cpu").flatten().tolist()]
+                step_traces_ser.append(tr2)
+            pred_stats["step_traces"] = step_traces_ser
+
             data_out["pred_stats"] = {
-                **by_mode["pred"][0].pred_stats,
+                **pred_stats,
                 "global_step_final": int(online_state.get("global_step", 0)),
             }
 
@@ -552,8 +569,6 @@ def main() -> None:
 
         out["by_dataset"][data_name] = data_out
 
-    # 旧的单数据集聚合/写盘逻辑已被上面的多数据集循环替代
-    # 这里统一在主进程写一次包含所有数据集的总 json
     if dist.is_main():
         os.makedirs(os.path.dirname(args.out_json) or ".", exist_ok=True)
         with open(args.out_json, "w", encoding="utf-8") as f:
