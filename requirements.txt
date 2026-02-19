@@ -9,3 +9,4 @@ ninja
 rich
 tqdm
 zstandard
+matplotlib
