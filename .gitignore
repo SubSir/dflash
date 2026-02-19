@@ -12,3 +12,5 @@ quantized_model/
 *.pt
 *.png
 llm-awq/
+
+*.json
