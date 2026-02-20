@@ -93,6 +93,7 @@ def generate_verify_all(
     total_draft_time = 0.0
     total_target_verify_calls = 0
     total_target_verify_tokens = 0
+    total_acc_tokens = 0
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -137,6 +138,7 @@ def generate_verify_all(
         acceptance_length = (
             (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
         )
+        total_acc_tokens += int(acceptance_length) + 1
 
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
@@ -173,6 +175,7 @@ def generate_verify_all(
         total_draft_time=total_draft_time,
         total_target_verify_calls=total_target_verify_calls,
         total_target_verify_tokens=total_target_verify_tokens,
+        total_acc_tokens=total_acc_tokens,
     )
 
 
@@ -188,7 +191,6 @@ def generate_verify_pred_k_online(
     offset: int,
     warmup_steps: int,
     temperature: float = 0.0,
-    online_state: dict | None = None,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -227,21 +229,23 @@ def generate_verify_pred_k_online(
     total_draft_time = 0.0
     total_target_verify_calls = 0
     total_target_verify_tokens = 0
+    total_acc_tokens = 0
+
+    # 诊断指标（只统计非 warmup 阶段）：
+    # - short_verify: verify_len < block_size 的比例
+    # - boundary_hit_when_short: verify_len < block_size 且 acc_true == verify_len 的比例
+    short_verify_count = 0
+    short_verify_denom = 0
+    boundary_hit_when_short_count = 0
+    boundary_hit_when_short_denom = 0
 
     num_pos = block_size - 1
 
-    if online_state is None:
-        online_state = {}
-
-    sum_by_acc = online_state.get("sum_by_acc")
-    count_by_acc = online_state.get("count_by_acc")
-    if sum_by_acc is None or count_by_acc is None:
-        sum_by_acc = torch.zeros((num_pos + 1, num_pos), device=model.device, dtype=torch.float32)
-        count_by_acc = torch.zeros((num_pos + 1,), device=model.device, dtype=torch.int64)
-        online_state["sum_by_acc"] = sum_by_acc
-        online_state["count_by_acc"] = count_by_acc
-    global_step = int(online_state.get("global_step", 0))
-    step_traces = online_state.setdefault("step_traces", [])
+    # 每次调用本函数即对应一个“独立的在线统计过程”。
+    sum_by_acc = torch.zeros((num_pos + 1, num_pos), device=model.device, dtype=torch.float32)
+    count_by_acc = torch.zeros((num_pos + 1,), device=model.device, dtype=torch.int64)
+    global_step = 0
+    step_traces = []
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -322,13 +326,20 @@ def generate_verify_pred_k_online(
         else:
             acceptance_length = 0
 
-        if global_step >= warmup_steps:
-            acceptance_length = int(min(int(acceptance_length), int(k)))
-
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids_k[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
         acc_true = int(acceptance_length) + 1
+        total_acc_tokens += int(acc_true)
+
+        if global_step >= warmup_steps:
+            short_verify_denom += 1
+            if int(verify_len) < int(block_size):
+                short_verify_count += 1
+                boundary_hit_when_short_denom += 1
+                if int(acc_true) == int(verify_len):
+                    boundary_hit_when_short_count += 1
+
         acc_true_idx = int(min(int(acc_true), int(num_pos)))
 
         trace = {
@@ -336,9 +347,9 @@ def generate_verify_pred_k_online(
             "thresholds": thresholds.detach(),
             "verify_len": int(verify_len),
             "acc_true": int(acc_true),
+            "acc_pred": int(acc_pred),
         }
         step_traces.append(trace)
-
 
         draft_update_start = cuda_time()
         if token_nll is not None:
@@ -353,7 +364,6 @@ def generate_verify_pred_k_online(
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, : acceptance_length + 1, :]
 
         global_step += 1
-        online_state["global_step"] = int(global_step)
 
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
@@ -378,9 +388,13 @@ def generate_verify_pred_k_online(
         "offset": int(offset),
         "global_step": int(global_step),
         "step_traces": step_traces,
+        "short_verify_count": int(short_verify_count),
+        "short_verify_denom": int(short_verify_denom),
+        "short_verify_prob": float(short_verify_count / max(1, short_verify_denom)),
+        "boundary_hit_when_short_count": int(boundary_hit_when_short_count),
+        "boundary_hit_when_short_denom": int(boundary_hit_when_short_denom),
+        "boundary_hit_when_short_prob": float(boundary_hit_when_short_count / max(1, boundary_hit_when_short_denom)),
     }
-
-    pred_stats["step_traces"] = step_traces
 
     return SimpleNamespace(
         num_input_tokens=num_input_tokens,
@@ -391,6 +405,7 @@ def generate_verify_pred_k_online(
         total_draft_time=total_draft_time,
         total_target_verify_calls=total_target_verify_calls,
         total_target_verify_tokens=total_target_verify_tokens,
+        total_acc_tokens=total_acc_tokens,
         pred_stats=pred_stats,
     )
 
@@ -410,7 +425,13 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--mode", type=str, default="both", choices=["both", "baseline", "pred"], help="Run baseline verify-all, pred verify-k (online), or both")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="both",
+        choices=["both", "baseline", "pred"],
+        help="Run baseline verify-all, pred verify-k (online), or both",
+    )
     parser.add_argument("--offset", type=int, default=2)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--out-json", type=str, default="speed_results.json")
@@ -424,17 +445,18 @@ def main() -> None:
 
     dist.init()
     torch.cuda.set_device(dist.local_rank())
-    device = torch.device(f"cuda:{dist.local_rank()}")
 
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         dtype=torch.bfloat16,
-    ).to(device).eval()
+    ).to(torch.device(f"cuda:{dist.local_rank()}"))
+    target.eval()
 
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_name_or_path,
         dtype=torch.bfloat16,
-    ).to(device).eval()
+    ).to(torch.device(f"cuda:{dist.local_rank()}"))
+    draft_model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     if tokenizer.mask_token_id is None:
@@ -453,17 +475,12 @@ def main() -> None:
             dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
 
         responses = []
-        online_state = {
-            "sum_by_acc": None,
-            "count_by_acc": None,
-            "global_step": 0,
-            "step_traces": [],
-        }
 
         indices = range(dist.rank(), len(dataset), dist.size())
         for idx in tqdm(indices, disable=not dist.is_main()):
             instance = dataset[idx]
             messages = []
+
             for user_content in instance["turns"]:
                 messages.append({"role": "user", "content": user_content})
                 input_text = tokenizer.apply_chat_template(
@@ -499,7 +516,6 @@ def main() -> None:
                         offset=args.offset,
                         warmup_steps=args.warmup_steps,
                         temperature=args.temperature,
-                        online_state=online_state,
                     )
                     responses.append(("pred", r_pred))
 
@@ -527,6 +543,7 @@ def main() -> None:
                 "total_target_verify_calls": int(sum(getattr(x, "total_target_verify_calls", 0) for x in rs)),
                 "total_target_verify_tokens": int(sum(getattr(x, "total_target_verify_tokens", 0) for x in rs)),
                 "num_output_tokens": float(sum(x.num_output_tokens for x in rs) / max(1, len(rs))),
+                "total_acc_tokens": float(sum(getattr(x, "total_acc_tokens", 0) for x in rs) / max(1, len(rs))),
             }
 
         data_out = {"dataset": data_name, "n_samples": int(len(dataset))}
@@ -535,12 +552,33 @@ def main() -> None:
         if by_mode["pred"]:
             data_out["pred_verify_k_online"] = _agg(by_mode["pred"])
 
-            # pred_stats 里包含 step_traces。我们在 decode 过程中为了避免频繁 GPU->CPU 拷贝，
-            # 可能会把 token_nll/thresholds 以 Tensor 的形式暂存在 trace 里。
-            # 写 JSON 前在 rank0 做一次轻量的可序列化转换。
-            pred_stats = dict(by_mode["pred"][0].pred_stats)
+            # 跨所有 pred 请求聚合诊断指标（只统计非 warmup 阶段）
+            total_short_count = 0
+            total_short_denom = 0
+            total_boundary_hit_count = 0
+            total_boundary_hit_denom = 0
+
+            for r in by_mode["pred"]:
+                ps = r.pred_stats
+                total_short_count += int(ps.get("short_verify_count", 0))
+                total_short_denom += int(ps.get("short_verify_denom", 0))
+                total_boundary_hit_count += int(ps.get("boundary_hit_when_short_count", 0))
+                total_boundary_hit_denom += int(ps.get("boundary_hit_when_short_denom", 0))
+
+            data_out["verify_len_diag"] = {
+                "short_verify_count": int(total_short_count),
+                "short_verify_denom": int(total_short_denom),
+                "short_verify_prob": float(total_short_count / max(1, total_short_denom)),
+                "boundary_hit_when_short_count": int(total_boundary_hit_count),
+                "boundary_hit_when_short_denom": int(total_boundary_hit_denom),
+                "boundary_hit_when_short_prob": float(total_boundary_hit_count / max(1, total_boundary_hit_denom)),
+                "num_pred_requests": int(len(by_mode["pred"])),
+            }
+
+            # pred_stats/step_traces 可能很大：保留一个示例（第一个请求）用于检查结构
+            first_pred_stats = dict(by_mode["pred"][0].pred_stats)
             step_traces_ser = []
-            for tr in pred_stats.get("step_traces", []) or []:
+            for tr in first_pred_stats.get("step_traces", []) or []:
                 if not isinstance(tr, dict):
                     step_traces_ser.append(tr)
                     continue
@@ -550,11 +588,10 @@ def main() -> None:
                     if isinstance(v, torch.Tensor):
                         tr2[k_] = [float(x) for x in v.detach().to("cpu").flatten().tolist()]
                 step_traces_ser.append(tr2)
-            pred_stats["step_traces"] = step_traces_ser
+            first_pred_stats["step_traces"] = step_traces_ser
 
-            data_out["pred_stats"] = {
-                **pred_stats,
-                "global_step_final": int(online_state.get("global_step", 0)),
+            data_out["pred_stats_example"] = {
+                **first_pred_stats,
             }
 
         if "baseline_verify_all" in data_out and "pred_verify_k_online" in data_out:
@@ -574,3 +611,7 @@ def main() -> None:
         with open(args.out_json, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=2)
         print("\n[speed] results saved to:", args.out_json)
+
+
+if __name__ == "__main__":
+    main()
