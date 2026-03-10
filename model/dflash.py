@@ -67,6 +67,9 @@ class Qwen3DFlashAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        retry_accept_length: Optional[int] = None,
+        retry_noise_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        collect_noise_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
@@ -84,7 +87,17 @@ class Qwen3DFlashAttention(nn.Module):
             v_ctx = self.v_proj(target_hidden)
         k_noise = self.k_proj(hidden_states)
         v_noise = self.v_proj(hidden_states)
-        v_noise = self.v_proj(hidden_states)
+
+        if collect_noise_kv is not None:
+            collect_noise_kv.append((k_noise.detach(), v_noise.detach()))
+
+        if retry_noise_kv is not None and retry_accept_length is not None and retry_accept_length > 0:
+            prev_k_noise, prev_v_noise = retry_noise_kv
+            accept_len = min(int(retry_accept_length), q_len, prev_k_noise.shape[1], prev_v_noise.shape[1])
+            if accept_len > 0:
+                k_noise = torch.cat([prev_k_noise[:, :accept_len, :], k_noise[:, accept_len:, :]], dim=1)
+                v_noise = torch.cat([prev_v_noise[:, :accept_len, :], v_noise[:, accept_len:, :]], dim=1)
+
         k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
         v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
         k = self.k_norm(k).transpose(1, 2)
@@ -132,6 +145,9 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        retry_accept_length: Optional[int] = None,
+        retry_noise_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        collect_noise_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -146,6 +162,9 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            retry_accept_length=retry_accept_length,
+            retry_noise_kv=retry_noise_kv,
+            collect_noise_kv=collect_noise_kv,
             **kwargs,
         )[0]
         hidden_states = residual + hidden_states
@@ -181,6 +200,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        retry_accept_length: Optional[int] = None,
+        retry_noise_kv_by_layer: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
+        collect_noise_kv_by_layer: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
@@ -203,7 +225,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         else:
             target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            retry_noise_kv = None
+            if retry_noise_kv_by_layer is not None and i < len(retry_noise_kv_by_layer):
+                retry_noise_kv = retry_noise_kv_by_layer[i]
+
             hidden_states = layer(
                 hidden_states=hidden_states,
                 target_hidden=target_hidden,
@@ -212,6 +238,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                retry_accept_length=retry_accept_length,
+                retry_noise_kv=retry_noise_kv,
+                collect_noise_kv=collect_noise_kv_by_layer,
                 **kwargs,
             )
         return self.norm(hidden_states)
